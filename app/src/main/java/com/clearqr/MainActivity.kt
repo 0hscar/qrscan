@@ -1,0 +1,337 @@
+package com.clearqr
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.core.ImageProxy
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.MultiFormatWriter
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+class MainActivity : ComponentActivity() {
+    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val captured = AtomicBoolean(false)
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var previewView: PreviewView? = null
+    private var scanFrame: FrameLayout? = null
+
+    private val requestCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) showScanner() else showPermissionMessage()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = Color.rgb(245, 244, 239)
+        window.navigationBarColor = Color.rgb(245, 244, 239)
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            showScanner()
+        } else {
+            showPermissionMessage()
+            requestCamera.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun showScanner() {
+        captured.set(false)
+        val root = createRoot()
+        addHeader(root, "Give it a\nclearer look.", "Read a QR code from anywhere and bring it back to life.")
+
+        val card = verticalLayout().apply {
+            background = roundedBackground(Color.WHITE, 26f)
+            setPadding(dp(14), dp(14), dp(14), dp(4))
+            elevation = dp(5).toFloat()
+        }
+        val params = LinearLayout.LayoutParams(-1, 0, 1f).apply {
+            topMargin = dp(8)
+            bottomMargin = dp(16)
+        }
+        root.addView(card, params)
+
+        val cameraFrame = FrameLayout(this).apply {
+            background = roundedBackground(Color.rgb(220, 229, 220), 18f)
+            clipToOutline = true
+        }
+        card.addView(cameraFrame, LinearLayout.LayoutParams(-1, 0, 1f))
+        previewView = PreviewView(this).apply {
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+        cameraFrame.addView(previewView, FrameLayout.LayoutParams(-1, -1))
+        addScanCorners(cameraFrame)
+        scanFrame = cameraFrame
+
+        val hint = TextView(this).apply {
+            text = "●   Align the code inside the frame"
+            setTextColor(Color.rgb(91, 101, 94))
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(15), 0, dp(15))
+        }
+        card.addView(hint, LinearLayout.LayoutParams(-1, -2))
+        addFooter(root)
+        setContentView(root)
+        startCamera()
+    }
+
+    private fun showPermissionMessage() {
+        val root = createRoot()
+        addHeader(root, "Camera access\nneeded.", "Your camera reads the code in real time. No photos are taken or stored.")
+        val button = actionButton("Enable camera") {
+            requestCamera.launch(Manifest.permission.CAMERA)
+        }
+        root.addView(button, LinearLayout.LayoutParams(-1, dp(54)).apply {
+            topMargin = dp(30)
+        })
+        addFooter(root)
+        setContentView(root)
+    }
+
+    private fun startCamera() {
+        val providerFuture = ProcessCameraProvider.getInstance(this)
+        providerFuture.addListener({
+            val provider = providerFuture.get()
+            cameraProvider = provider
+            val preview = Preview.Builder().build().also {
+                it.surfaceProvider = previewView?.surfaceProvider
+            }
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+            val options = BarcodeScannerOptions.Builder()
+                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                .build()
+            val scanner = BarcodeScanning.getClient(options)
+
+            analysis.setAnalyzer(cameraExecutor) { imageProxy -> processFrame(scanner, imageProxy) }
+            try {
+                provider.unbindAll()
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            } catch (_: Exception) {
+                showCameraError()
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    @OptIn(ExperimentalGetImage::class)
+    private fun processFrame(scanner: com.google.mlkit.vision.barcode.BarcodeScanner, proxy: ImageProxy) {
+        val mediaImage = proxy.image
+        if (mediaImage == null || captured.get()) {
+            proxy.close()
+            return
+        }
+        val input = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
+        scanner.process(input)
+            .addOnSuccessListener { codes ->
+                val value = codes.firstOrNull()?.rawValue ?: return@addOnSuccessListener
+                if (captured.compareAndSet(false, true)) showResult(value)
+            }
+            .addOnFailureListener { }
+            .addOnCompleteListener { proxy.close() }
+    }
+
+    private fun showResult(value: String) {
+        cameraProvider?.unbindAll()
+        val root = createRoot()
+        addHeader(root, "Ready to scan.", "Scan it!.")
+        val card = verticalLayout().apply {
+            background = roundedBackground(Color.WHITE, 26f)
+            setPadding(dp(22), dp(22), dp(22), dp(22))
+            gravity = Gravity.CENTER_HORIZONTAL
+            elevation = dp(5).toFloat()
+        }
+        root.addView(card, LinearLayout.LayoutParams(-1, 0, 1f).apply {
+            topMargin = dp(8)
+            bottomMargin = dp(16)
+        })
+
+        try {
+            val bitmap = createQrBitmap(value)
+            val image = ImageView(this).apply {
+                setImageBitmap(bitmap)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                contentDescription = "Recreated QR code"
+                background = roundedBackground(Color.WHITE, 16f)
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+            }
+            card.addView(image, LinearLayout.LayoutParams(dp(250), dp(250)))
+        } catch (_: Exception) {
+            val error = label("This QR code contains too much data to recreate.", 15f, Color.rgb(145, 65, 54))
+            card.addView(error)
+        }
+
+        val caption = label("YOUR RECREATED CODE", 10f, Color.rgb(130, 144, 135)).apply {
+            letterSpacing = 0.16f
+            setPadding(0, dp(18), 0, dp(7))
+        }
+        card.addView(caption)
+        card.addView(label(value, 13f, Color.rgb(55, 69, 61)))
+        val again = actionButton("Scan another") {
+            showScanner()
+        }
+        card.addView(again, LinearLayout.LayoutParams(-1, dp(50)).apply {
+            topMargin = dp(20)
+        })
+        addFooter(root)
+        setContentView(root)
+    }
+
+    private fun showCameraError() {
+        val root = createRoot()
+        addHeader(root, "Camera unavailable.", "Close other camera apps and try again.")
+        root.addView(actionButton("Try again") { showScanner() }, LinearLayout.LayoutParams(-1, dp(54)))
+        addFooter(root)
+        setContentView(root)
+    }
+
+    private fun createQrBitmap(value: String): Bitmap {
+        val hints = mapOf(EncodeHintType.MARGIN to 1)
+        val matrix = MultiFormatWriter().encode(value, BarcodeFormat.QR_CODE, 720, 720, hints)
+        val pixels = IntArray(720 * 720)
+        for (y in 0 until 720) for (x in 0 until 720) {
+            pixels[y * 720 + x] = if (matrix[x, y]) Color.rgb(23, 37, 31) else Color.WHITE
+        }
+        return Bitmap.createBitmap(pixels, 720, 720, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun createRoot(): LinearLayout = verticalLayout().apply {
+        setBackgroundColor(Color.rgb(245, 244, 239))
+        setPadding(dp(26), dp(18), dp(26), 0)
+        fitsSystemWindows = true
+    }
+
+    private fun addHeader(root: LinearLayout, title: String, subtitle: String) {
+        val brand = TextView(this).apply {
+            text = "▣  CLEAR QR"
+            setTextColor(Color.rgb(49, 92, 73))
+            textSize = 14f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(0, 0, 0, dp(18))
+        }
+        root.addView(brand)
+        val heading = TextView(this).apply {
+            text = title
+            setTextColor(Color.rgb(23, 37, 31))
+            textSize = 36f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            letterSpacing = -0.03f
+            setLineSpacing(0f, 0.96f)
+            setPadding(dp(8), 0, 0, 0)
+        }
+        root.addView(heading)
+        val description = TextView(this).apply {
+            text = subtitle
+            setTextColor(Color.rgb(114, 122, 115))
+            textSize = 15f
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(dp(8), dp(9), 0, 0)
+        }
+        root.addView(description)
+    }
+
+    private fun addFooter(root: LinearLayout) {
+        val footer = TextView(this).apply {
+            text = "✦   No saved photos here"
+            setTextColor(Color.rgb(137, 145, 137))
+            textSize = 11f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, dp(20))
+        }
+        root.addView(footer)
+    }
+
+    private fun addScanCorners(frame: FrameLayout) {
+        val size = dp(42)
+        val inset = dp(28)
+        val green = Color.rgb(167, 237, 179)
+        val stroke = dp(4)
+        val corners = listOf(
+            Triple(Gravity.TOP or Gravity.START, true, true),
+            Triple(Gravity.TOP or Gravity.END, true, false),
+            Triple(Gravity.BOTTOM or Gravity.START, false, true),
+            Triple(Gravity.BOTTOM or Gravity.END, false, false),
+        )
+        corners.forEach { (gravity, top, left) ->
+            val corner = View(this).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(Color.TRANSPARENT)
+                    setStroke(stroke, green)
+                    cornerRadius = dp(9).toFloat()
+                }
+                // Cover the two inner edges to leave a clean L-shaped finder.
+                if (top || left) alpha = 0.96f
+            }
+            val params = FrameLayout.LayoutParams(size, size, gravity).apply {
+                if (gravity and Gravity.START == Gravity.START) leftMargin = inset else rightMargin = inset
+                if (gravity and Gravity.TOP == Gravity.TOP) topMargin = inset else bottomMargin = inset
+            }
+            frame.addView(corner, params)
+        }
+        val line = View(this).apply { setBackgroundColor(green) }
+        frame.addView(line, FrameLayout.LayoutParams(-1, dp(2), Gravity.CENTER).apply {
+            leftMargin = inset * 2
+            rightMargin = inset * 2
+        })
+    }
+
+    private fun actionButton(text: String, action: () -> Unit) = Button(this).apply {
+        this.text = text
+        setTextColor(Color.WHITE)
+        textSize = 14f
+        isAllCaps = false
+        background = roundedBackground(Color.rgb(49, 92, 73), 14f)
+        setOnClickListener { action() }
+    }
+
+    private fun label(text: String, size: Float, color: Int) = TextView(this).apply {
+        this.text = text
+        textSize = size
+        setTextColor(color)
+        gravity = Gravity.CENTER
+        maxLines = 3
+    }
+
+    private fun verticalLayout() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+    }
+
+    private fun roundedBackground(color: Int, radius: Float) = android.graphics.drawable.GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radius.toInt()).toFloat()
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    override fun onDestroy() {
+        cameraProvider?.unbindAll()
+        cameraExecutor.shutdown()
+        super.onDestroy()
+    }
+}
