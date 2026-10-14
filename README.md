@@ -40,8 +40,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 You can also copy the APK to an Android device and open it. Android may prompt you to allow installs from that file manager. Debug APKs are for testing; they are not the recommended way to distribute a public release.
 
-## Create a release
+## Create a signed APK
 
-For a directly installable release, choose **Build → Generate Signed Bundle / APK → APK** in Android Studio. Create or select a signing key and keep it secure—future updates must be signed with the same key. Android Studio shows the output location when it finishes.
-
-For Google Play, choose **Android App Bundle (AAB)** in the same wizard. An AAB is a publishing format and cannot be installed directly like an APK; Google Play generates device-specific APKs from it. For local testing of an AAB, use Google's `bundletool` to generate and install APKs.
+For a standalone APK signed with your own key, choose **Build → Generate Signed Bundle / APK → APK** in Android Studio. Create a signing key and keep it secure. Android Studio shows the APK output location when it finishes.
