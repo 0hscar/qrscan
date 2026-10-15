@@ -45,11 +45,13 @@ class MainActivity : ComponentActivity() {
         if (granted) showScanner() else showPermissionMessage()
     }
 
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = Color.rgb(245, 244, 239)
         window.navigationBarColor = Color.rgb(245, 244, 239)
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.decorView.systemUiVisibility =
+            View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             showScanner()
@@ -101,9 +103,14 @@ class MainActivity : ComponentActivity() {
         startCamera()
     }
 
+
     private fun showPermissionMessage() {
         val root = createRoot()
-        addHeader(root, "Camera access\nneeded.", "Your camera reads the code in real time. No photos are taken or stored.")
+        addHeader(
+            root,
+            "Camera access\nneeded.",
+            "Your camera reads the code in real time. No photos are taken or stored."
+        )
         val button = actionButton("Enable camera") {
             requestCamera.launch(Manifest.permission.CAMERA)
         }
@@ -126,7 +133,7 @@ class MainActivity : ComponentActivity() {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
             val options = BarcodeScannerOptions.Builder()
-                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                .setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS)
                 .build()
             val scanner = BarcodeScanning.getClient(options)
 
@@ -150,14 +157,16 @@ class MainActivity : ComponentActivity() {
         val input = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
         scanner.process(input)
             .addOnSuccessListener { codes ->
-                val value = codes.firstOrNull()?.rawValue ?: return@addOnSuccessListener
-                if (captured.compareAndSet(false, true)) showResult(value)
+                val code = codes.firstOrNull { !it.rawValue.isNullOrEmpty() }
+                    ?: return@addOnSuccessListener
+                val value = code.rawValue ?: return@addOnSuccessListener
+                if (captured.compareAndSet(false, true)) showResult(value, code.format)
             }
             .addOnFailureListener { }
             .addOnCompleteListener { proxy.close() }
     }
 
-    private fun showResult(value: String) {
+    private fun showResult(value: String, scannedFormat: Int) {
         cameraProvider?.unbindAll()
         val root = createRoot()
         addHeader(root, "Ready to scan.", "Scan it!.")
@@ -173,24 +182,27 @@ class MainActivity : ComponentActivity() {
         })
 
         try {
-            val bitmap = createQrBitmap(value)
+            val barcodeFormat = scannedFormat.toZxingFormat()
+                ?: throw IllegalArgumentException("Unsupported barcode format")
+            val bitmap = createBarcodeBitmap(value, barcodeFormat)
             val image = ImageView(this).apply {
                 setImageBitmap(bitmap)
                 scaleType = ImageView.ScaleType.FIT_CENTER
-                contentDescription = "Recreated QR code"
+                contentDescription = "Recreated ${scannedFormat.displayName()}"
                 background = roundedBackground(Color.WHITE, 16f)
                 setPadding(dp(10), dp(10), dp(10), dp(10))
             }
             card.addView(image, LinearLayout.LayoutParams(dp(250), dp(250)))
         } catch (_: Exception) {
-            val error = label("This QR code contains too much data to recreate.", 15f, Color.rgb(145, 65, 54))
+            val error = label("This barcode format or data could not be recreated.", 15f, Color.rgb(145, 65, 54))
             card.addView(error)
         }
 
-        val caption = label("YOUR RECREATED CODE", 10f, Color.rgb(130, 144, 135)).apply {
-            letterSpacing = 0.16f
-            setPadding(0, dp(18), 0, dp(7))
-        }
+        val caption =
+            label("YOUR RECREATED ${scannedFormat.displayName().uppercase()}", 10f, Color.rgb(130, 144, 135)).apply {
+                letterSpacing = 0.16f
+                setPadding(0, dp(18), 0, dp(7))
+            }
         card.addView(caption)
         card.addView(label(value, 13f, Color.rgb(55, 69, 61)))
         val again = actionButton("Scan another") {
@@ -211,14 +223,66 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
-    private fun createQrBitmap(value: String): Bitmap {
-        val hints = mapOf(EncodeHintType.MARGIN to 1)
-        val matrix = MultiFormatWriter().encode(value, BarcodeFormat.QR_CODE, 720, 720, hints)
-        val pixels = IntArray(720 * 720)
-        for (y in 0 until 720) for (x in 0 until 720) {
-            pixels[y * 720 + x] = if (matrix[x, y]) Color.rgb(23, 37, 31) else Color.WHITE
+    private fun createBarcodeBitmap(value: String, format: BarcodeFormat): Bitmap {
+        val isLinear = format in setOf(
+            BarcodeFormat.CODE_39,
+            BarcodeFormat.CODE_93,
+            BarcodeFormat.CODE_128,
+            BarcodeFormat.CODABAR,
+            BarcodeFormat.EAN_8,
+            BarcodeFormat.EAN_13,
+            BarcodeFormat.ITF,
+            BarcodeFormat.UPC_A,
+            BarcodeFormat.UPC_E
+        )
+        val width =
+            if (format == BarcodeFormat.QR_CODE || format == BarcodeFormat.DATA_MATRIX || format == BarcodeFormat.AZTEC) 720 else 960
+        val height = when {
+            isLinear -> 300
+            format == BarcodeFormat.PDF_417 -> 480
+            else -> 720
         }
-        return Bitmap.createBitmap(pixels, 720, 720, Bitmap.Config.ARGB_8888)
+        val hints = mapOf(EncodeHintType.MARGIN to if (isLinear) 16 else 1)
+        val matrix = MultiFormatWriter().encode(value, format, width, height, hints)
+        val pixels = IntArray(matrix.width * matrix.height)
+        for (y in 0 until matrix.height) for (x in 0 until matrix.width) {
+            pixels[y * matrix.width + x] = if (matrix[x, y]) Color.rgb(23, 37, 31) else Color.WHITE
+        }
+        return Bitmap.createBitmap(pixels, matrix.width, matrix.height, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun Int.toZxingFormat(): BarcodeFormat? = when (this) {
+        Barcode.FORMAT_QR_CODE -> BarcodeFormat.QR_CODE
+        Barcode.FORMAT_AZTEC -> BarcodeFormat.AZTEC
+        Barcode.FORMAT_DATA_MATRIX -> BarcodeFormat.DATA_MATRIX
+        Barcode.FORMAT_PDF417 -> BarcodeFormat.PDF_417
+        Barcode.FORMAT_CODE_128 -> BarcodeFormat.CODE_128
+        Barcode.FORMAT_CODE_39 -> BarcodeFormat.CODE_39
+        Barcode.FORMAT_CODE_93 -> BarcodeFormat.CODE_93
+        Barcode.FORMAT_CODABAR -> BarcodeFormat.CODABAR
+        Barcode.FORMAT_EAN_8 -> BarcodeFormat.EAN_8
+        Barcode.FORMAT_EAN_13 -> BarcodeFormat.EAN_13
+        Barcode.FORMAT_ITF -> BarcodeFormat.ITF
+        Barcode.FORMAT_UPC_A -> BarcodeFormat.UPC_A
+        Barcode.FORMAT_UPC_E -> BarcodeFormat.UPC_E
+        else -> null
+    }
+
+    private fun Int.displayName(): String = when (this) {
+        Barcode.FORMAT_QR_CODE -> "QR code"
+        Barcode.FORMAT_AZTEC -> "Aztec barcode"
+        Barcode.FORMAT_DATA_MATRIX -> "Data Matrix barcode"
+        Barcode.FORMAT_PDF417 -> "PDF417 barcode"
+        Barcode.FORMAT_CODE_128 -> "Code 128 barcode"
+        Barcode.FORMAT_CODE_39 -> "Code 39 barcode"
+        Barcode.FORMAT_CODE_93 -> "Code 93 barcode"
+        Barcode.FORMAT_CODABAR -> "Codabar"
+        Barcode.FORMAT_EAN_8 -> "EAN-8 barcode"
+        Barcode.FORMAT_EAN_13 -> "EAN-13 barcode"
+        Barcode.FORMAT_ITF -> "ITF barcode"
+        Barcode.FORMAT_UPC_A -> "UPC-A barcode"
+        Barcode.FORMAT_UPC_E -> "UPC-E barcode"
+        else -> "barcode"
     }
 
     private fun createRoot(): LinearLayout = verticalLayout().apply {

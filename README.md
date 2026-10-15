@@ -1,6 +1,10 @@
 # ClearQR for Android
 
-A native Kotlin QR scanner. CameraX streams frames to ML Kit for QR-code detection, and ZXing recreates the decoded text as a clean QR code on screen. The app does not take photos, write scan history, or upload scans. The decoded value and generated bitmap stay in memory for the current screen only.
+ClearQR is a native Kotlin app that reads a code with the camera and redraws a crisp, scannable version on screen.
+
+- **Supported formats:** QR, EAN-8/13, UPC-A/E, Code 39/93/128, Codabar, ITF, Aztec, Data Matrix, and PDF417.
+- **Recreation:** The decoded value is rendered in the detected barcode format where ZXing supports that format. The new code preserves the data, not the photographed code's exact appearance.
+- **Privacy:** No photo is taken, and scans are not saved or uploaded. The decoded value and generated image stay in memory only while displayed.
 
 ## Requirements
 
