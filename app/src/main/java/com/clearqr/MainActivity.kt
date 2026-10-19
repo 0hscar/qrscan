@@ -184,7 +184,7 @@ class MainActivity : ComponentActivity() {
                 }
                 val barcodeBounds = code.boundingBox
                 if (barcodeBounds == null) {
-                    showCapturedResult(value, code.format, emptyList())
+                    showCapturedResult(value, code.format, null)
                     finishFrame(proxy)
                     return@addOnSuccessListener
                 }
@@ -192,17 +192,17 @@ class MainActivity : ComponentActivity() {
                 recognizer.process(input)
                     .addOnSuccessListener { recognizedText ->
                         val bounds = barcodeBounds.toImageBounds()
-                        val elements = recognizedText.textBlocks.flatMap { block ->
-                            block.lines.flatMap { line ->
-                                line.elements.mapNotNull { element ->
-                                    element.boundingBox?.let { RecognizedTextElement(element.text, it.toImageBounds()) }
+                        val lines = recognizedText.textBlocks.flatMap { block ->
+                            block.lines.mapNotNull { line ->
+                                line.boundingBox?.let {
+                                    RecognizedTextLine(line.text, it.toImageBounds())
                                 }
                             }
                         }
-                        showCapturedResult(value, code.format, NearbyNumberExtractor.extract(bounds, elements))
+                        showCapturedResult(value, code.format, NearbyNumberExtractor.findNearbyLines(bounds, lines))
                     }
                     .addOnFailureListener {
-                        showCapturedResult(value, code.format, emptyList())
+                        showCapturedResult(value, code.format, null)
                     }
                     .addOnCompleteListener { finishFrame(proxy) }
             }
@@ -211,8 +211,8 @@ class MainActivity : ComponentActivity() {
 
     private fun android.graphics.Rect.toImageBounds() = ImageBounds(left, top, right, bottom)
 
-    private fun showCapturedResult(value: String, format: Int, nearbyNumbers: List<String>) {
-        if (captured.compareAndSet(false, true)) showResult(value, format, nearbyNumbers)
+    private fun showCapturedResult(value: String, format: Int, nearbyText: List<String>?) {
+        if (captured.compareAndSet(false, true)) showResult(value, format, nearbyText)
     }
 
     private fun finishFrame(proxy: ImageProxy) {
@@ -223,7 +223,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun showResult(value: String, scannedFormat: Int, nearbyNumbers: List<String>) {
+    private fun showResult(value: String, scannedFormat: Int, nearbyText: List<String>?) {
         cameraProvider?.unbindAll()
         val root = createRoot()
         addHeader(root, "Ready to scan.", "Scan it!.")
@@ -253,27 +253,36 @@ class MainActivity : ComponentActivity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
             }
-            val imageParams = if (nearbyNumbers.isEmpty()) {
+            val hasNearbyText = !nearbyText.isNullOrEmpty()
+            val imageParams = if (!hasNearbyText) {
                 LinearLayout.LayoutParams(dp(250), dp(250))
             } else {
                 LinearLayout.LayoutParams(0, dp(250), 1f)
             }
             barcodeRow.addView(image, imageParams)
-            if (nearbyNumbers.isNotEmpty()) {
-                val numberView = label(nearbyNumbers.joinToString("\n"), 24f, Color.rgb(23, 37, 31)).apply {
+            if (hasNearbyText) {
+                val textView = label(nearbyText.orEmpty().joinToString("\n"), 18f, Color.rgb(23, 37, 31)).apply {
                     gravity = Gravity.CENTER
-                    maxLines = nearbyNumbers.size
+                    maxLines = (nearbyText?.size ?: 1) * 2
                     setPadding(dp(12), 0, 0, 0)
-                    contentDescription = "Numbers next to barcode: ${nearbyNumbers.joinToString(", ")}"
+                    contentDescription = "Text next to barcode: ${nearbyText.orEmpty().joinToString(", ")}"
                 }
-                barcodeRow.addView(numberView, LinearLayout.LayoutParams(0, dp(250), 1f))
+                barcodeRow.addView(textView, LinearLayout.LayoutParams(0, dp(250), 1f))
             }
-            val rowParams = if (nearbyNumbers.isEmpty()) {
+            val rowParams = if (!hasNearbyText) {
                 LinearLayout.LayoutParams(dp(250), dp(250))
             } else {
                 LinearLayout.LayoutParams(-1, dp(250))
             }
             card.addView(barcodeRow, rowParams)
+            if (scannedFormat == Barcode.FORMAT_QR_CODE && !hasNearbyText) {
+                val message = if (nearbyText == null) {
+                    "Could not read nearby text."
+                } else {
+                    "No nearby text with numbers found."
+                }
+                card.addView(label(message, 13f, Color.rgb(130, 144, 135)))
+            }
         } catch (_: Exception) {
             val error = label("This barcode format or data could not be recreated.", 15f, Color.rgb(145, 65, 54))
             card.addView(error)

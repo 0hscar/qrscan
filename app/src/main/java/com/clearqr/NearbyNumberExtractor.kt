@@ -7,21 +7,28 @@ internal data class ImageBounds(val left: Int, val top: Int, val right: Int, val
         get() = bottom - top
 }
 
-internal data class RecognizedTextElement(val text: String, val bounds: ImageBounds)
+internal data class RecognizedTextLine(val text: String, val bounds: ImageBounds)
 
 internal object NearbyNumberExtractor {
     private val numberPattern =
         Regex("(?<![\\p{L}\\p{N}])\\+?\\d(?:[\\d\\s()./-]*\\d)?(?![\\p{L}\\p{N}])")
 
-    fun extract(barcode: ImageBounds, elements: List<RecognizedTextElement>): List<String> {
+    fun findNearbyLines(barcode: ImageBounds, lines: List<RecognizedTextLine>): List<String> {
         val maxGap = maxOf(barcode.width, barcode.height) * 0.75
-        return elements.asSequence()
+        return lines.asSequence()
             .filter { isNearby(barcode, it.bounds, maxGap) }
-            .flatMap { element -> numberPattern.findAll(element.text).map { it.value.trim() } }
-            .filter(String::isNotEmpty)
+            .filter { line -> numberPattern.containsMatchIn(line.text) }
+            .map { it.text.trim() }
             .distinct()
             .toList()
     }
+
+    fun extractNumbers(lines: List<String>): List<String> =
+        lines.asSequence()
+            .flatMap { line -> numberPattern.findAll(line).map { it.value.trim() } }
+            .filter(String::isNotEmpty)
+            .distinct()
+            .toList()
 
     private fun isNearby(barcode: ImageBounds, text: ImageBounds, maxGap: Double): Boolean {
         if (barcode.width <= 0 || barcode.height <= 0 || text.width <= 0 || text.height <= 0) return false
