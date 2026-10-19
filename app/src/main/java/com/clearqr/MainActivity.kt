@@ -27,8 +27,8 @@ import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
@@ -40,7 +40,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : ComponentActivity() {
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val captured = AtomicBoolean(false)
+    private val processingFrame = AtomicBoolean(false)
     private var cameraProvider: ProcessCameraProvider? = null
+    private var textRecognizer: TextRecognizer? = null
     private var previewView: PreviewView? = null
     private var scanFrame: FrameLayout? = null
 
@@ -139,11 +141,10 @@ class MainActivity : ComponentActivity() {
                 .setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS)
                 .build()
             val scanner = BarcodeScanning.getClient(options)
-            val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            val recognizer = textRecognizer ?: TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                .also { textRecognizer = it }
 
-            analysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                processFrame(scanner, textRecognizer, imageProxy)
-            }
+            analysis.setAnalyzer(cameraExecutor) { imageProxy -> processFrame(scanner, recognizer, imageProxy) }
             try {
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
@@ -156,11 +157,11 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalGetImage::class)
     private fun processFrame(
         scanner: com.google.mlkit.vision.barcode.BarcodeScanner,
-        textRecognizer: com.google.mlkit.vision.text.TextRecognizer,
+        recognizer: TextRecognizer,
         proxy: ImageProxy
     ) {
         val mediaImage = proxy.image
-        if (mediaImage == null || captured.get()) {
+        if (mediaImage == null || captured.get() || !processingFrame.compareAndSet(false, true)) {
             proxy.close()
             return
         }
@@ -168,69 +169,61 @@ class MainActivity : ComponentActivity() {
         scanner.process(input)
             .addOnSuccessListener { codes ->
                 val code = codes.firstOrNull { !it.rawValue.isNullOrEmpty() }
-                val value = code?.rawValue
-                if (code == null || value == null) {
-                    proxy.close()
+                if (code == null) {
+                    finishFrame(proxy)
+                    return@addOnSuccessListener
+                }
+                val value = code.rawValue ?: run {
+                    finishFrame(proxy)
+                    return@addOnSuccessListener
+                }
+                if (code.format != Barcode.FORMAT_QR_CODE) {
+                    showCapturedResult(value, code.format, emptyList())
+                    finishFrame(proxy)
+                    return@addOnSuccessListener
+                }
+                val barcodeBounds = code.boundingBox
+                if (barcodeBounds == null) {
+                    showCapturedResult(value, code.format, emptyList())
+                    finishFrame(proxy)
                     return@addOnSuccessListener
                 }
 
-                if (code.format == Barcode.FORMAT_QR_CODE) {
-                    textRecognizer.process(input)
-                        .addOnSuccessListener { text ->
-                            if (captured.compareAndSet(false, true)) {
-                                showResult(value, code.format, findAdjacentNumber(text, code))
+                recognizer.process(input)
+                    .addOnSuccessListener { recognizedText ->
+                        val bounds = barcodeBounds.toImageBounds()
+                        val elements = recognizedText.textBlocks.flatMap { block ->
+                            block.lines.flatMap { line ->
+                                line.elements.mapNotNull { element ->
+                                    element.boundingBox?.let { RecognizedTextElement(element.text, it.toImageBounds()) }
+                                }
                             }
                         }
-                        .addOnFailureListener {
-                            if (captured.compareAndSet(false, true)) showResult(value, code.format, null)
-                        }
-                        .addOnCompleteListener { proxy.close() }
-                } else if (captured.compareAndSet(false, true)) {
-                    showResult(value, code.format, null)
-                    proxy.close()
-                } else {
-                    proxy.close()
-                }
+                        showCapturedResult(value, code.format, NearbyNumberExtractor.extract(bounds, elements))
+                    }
+                    .addOnFailureListener {
+                        showCapturedResult(value, code.format, emptyList())
+                    }
+                    .addOnCompleteListener { finishFrame(proxy) }
             }
-            .addOnFailureListener { proxy.close() }
+            .addOnFailureListener { finishFrame(proxy) }
     }
 
-    private fun findAdjacentNumber(text: Text, barcode: Barcode): String? {
-        val barcodeBox = barcode.boundingBox ?: return null
-        val candidates = text.textBlocks
-            .flatMap { block -> block.lines }
-            .mapNotNull { line ->
-                val box = line.boundingBox ?: return@mapNotNull null
-                val value = line.text.trim()
-                if (value.matches(Regex("[0-9][0-9\\s.,:/-]*"))) box to value else null
-            }
-            .filter { (box, _) ->
-                val beside = box.left >= barcodeBox.right || box.right <= barcodeBox.left
-                val verticalDistance = when {
-                    box.bottom < barcodeBox.top -> barcodeBox.top - box.bottom
-                    box.top > barcodeBox.bottom -> box.top - barcodeBox.bottom
-                    else -> 0
-                }
-                beside && verticalDistance <= barcodeBox.height()
-            }
+    private fun android.graphics.Rect.toImageBounds() = ImageBounds(left, top, right, bottom)
 
-        return candidates.minByOrNull { (box, _) ->
-            val horizontalGap = when {
-                box.left >= barcodeBox.right -> box.left - barcodeBox.right
-                else -> barcodeBox.left - box.right
-            }
-            horizontalGap + kotlin.math.abs(box.centerY() - barcodeBox.centerY())
-        }?.takeIf { (box, _) ->
-            val horizontalGap = if (box.left >= barcodeBox.right) {
-                box.left - barcodeBox.right
-            } else {
-                barcodeBox.left - box.right
-            }
-            horizontalGap <= barcodeBox.width()
-        }?.second?.replace(Regex("\\s+"), " ")
+    private fun showCapturedResult(value: String, format: Int, nearbyNumbers: List<String>) {
+        if (captured.compareAndSet(false, true)) showResult(value, format, nearbyNumbers)
     }
 
-    private fun showResult(value: String, scannedFormat: Int, adjacentNumber: String?) {
+    private fun finishFrame(proxy: ImageProxy) {
+        try {
+            proxy.close()
+        } finally {
+            processingFrame.set(false)
+        }
+    }
+
+    private fun showResult(value: String, scannedFormat: Int, nearbyNumbers: List<String>) {
         cameraProvider?.unbindAll()
         val root = createRoot()
         addHeader(root, "Ready to scan.", "Scan it!.")
@@ -260,21 +253,22 @@ class MainActivity : ComponentActivity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
             }
-            val imageParams = if (adjacentNumber == null) {
+            val imageParams = if (nearbyNumbers.isEmpty()) {
                 LinearLayout.LayoutParams(dp(250), dp(250))
             } else {
                 LinearLayout.LayoutParams(0, dp(250), 1f)
             }
             barcodeRow.addView(image, imageParams)
-            adjacentNumber?.let { number ->
-                val numberView = label(number, 30f, Color.rgb(23, 37, 31)).apply {
+            if (nearbyNumbers.isNotEmpty()) {
+                val numberView = label(nearbyNumbers.joinToString("\n"), 24f, Color.rgb(23, 37, 31)).apply {
                     gravity = Gravity.CENTER
-                    setPadding(dp(16), 0, 0, 0)
-                    contentDescription = "Number next to barcode: $number"
+                    maxLines = nearbyNumbers.size
+                    setPadding(dp(12), 0, 0, 0)
+                    contentDescription = "Numbers next to barcode: ${nearbyNumbers.joinToString(", ")}"
                 }
-                barcodeRow.addView(numberView, LinearLayout.LayoutParams(-2, dp(250)))
+                barcodeRow.addView(numberView, LinearLayout.LayoutParams(0, dp(250), 1f))
             }
-            val rowParams = if (adjacentNumber == null) {
+            val rowParams = if (nearbyNumbers.isEmpty()) {
                 LinearLayout.LayoutParams(dp(250), dp(250))
             } else {
                 LinearLayout.LayoutParams(-1, dp(250))
@@ -482,6 +476,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         cameraProvider?.unbindAll()
+        textRecognizer?.close()
         cameraExecutor.shutdown()
         super.onDestroy()
     }
