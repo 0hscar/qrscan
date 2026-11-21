@@ -33,6 +33,9 @@ import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatWriter
@@ -45,7 +48,9 @@ private data class SavedCode(val name: String, val value: String, val format: In
 class MainActivity : ComponentActivity() {
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val captured = AtomicBoolean(false)
+    private val processingFrame = AtomicBoolean(false)
     private var cameraProvider: ProcessCameraProvider? = null
+    private var textRecognizer: TextRecognizer? = null
     private var previewView: PreviewView? = null
     private var scanFrame: FrameLayout? = null
     private var saveDirectory: Uri? = null
@@ -175,8 +180,10 @@ class MainActivity : ComponentActivity() {
                 .setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS)
                 .build()
             val scanner = BarcodeScanning.getClient(options)
+            val recognizer = textRecognizer ?: TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                .also { textRecognizer = it }
 
-            analysis.setAnalyzer(cameraExecutor) { imageProxy -> processFrame(scanner, imageProxy) }
+            analysis.setAnalyzer(cameraExecutor) { imageProxy -> processFrame(scanner, recognizer, imageProxy) }
             try {
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
@@ -187,9 +194,13 @@ class MainActivity : ComponentActivity() {
     }
 
     @OptIn(ExperimentalGetImage::class)
-    private fun processFrame(scanner: com.google.mlkit.vision.barcode.BarcodeScanner, proxy: ImageProxy) {
+    private fun processFrame(
+        scanner: com.google.mlkit.vision.barcode.BarcodeScanner,
+        recognizer: TextRecognizer,
+        proxy: ImageProxy
+    ) {
         val mediaImage = proxy.image
-        if (mediaImage == null || captured.get()) {
+        if (mediaImage == null || captured.get() || !processingFrame.compareAndSet(false, true)) {
             proxy.close()
             return
         }
@@ -209,8 +220,21 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-            .addOnFailureListener { }
-            .addOnCompleteListener { proxy.close() }
+            .addOnFailureListener { finishFrame(proxy) }
+    }
+
+    private fun android.graphics.Rect.toImageBounds() = ImageBounds(left, top, right, bottom)
+
+    private fun showCapturedResult(value: String, format: Int, nearbyText: List<String>?) {
+        if (captured.compareAndSet(false, true)) showResult(value, format, nearbyText)
+    }
+
+    private fun finishFrame(proxy: ImageProxy) {
+        try {
+            proxy.close()
+        } finally {
+            processingFrame.set(false)
+        }
     }
 
     private fun showResult(value: String, scannedFormat: Int, existingName: String? = null) {
@@ -245,7 +269,40 @@ class MainActivity : ComponentActivity() {
                 background = roundedBackground(Color.WHITE, 16f)
                 setPadding(dp(10), dp(10), dp(10), dp(10))
             }
-            card.addView(image, LinearLayout.LayoutParams(dp(250), dp(250)))
+            val barcodeRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            val hasNearbyText = !nearbyText.isNullOrEmpty()
+            val imageParams = if (!hasNearbyText) {
+                LinearLayout.LayoutParams(dp(250), dp(250))
+            } else {
+                LinearLayout.LayoutParams(0, dp(250), 1f)
+            }
+            barcodeRow.addView(image, imageParams)
+            if (hasNearbyText) {
+                val textView = label(nearbyText.orEmpty().joinToString("\n"), 18f, Color.rgb(23, 37, 31)).apply {
+                    gravity = Gravity.CENTER
+                    maxLines = (nearbyText?.size ?: 1) * 2
+                    setPadding(dp(12), 0, 0, 0)
+                    contentDescription = "Text next to barcode: ${nearbyText.orEmpty().joinToString(", ")}"
+                }
+                barcodeRow.addView(textView, LinearLayout.LayoutParams(0, dp(250), 1f))
+            }
+            val rowParams = if (!hasNearbyText) {
+                LinearLayout.LayoutParams(dp(250), dp(250))
+            } else {
+                LinearLayout.LayoutParams(-1, dp(250))
+            }
+            card.addView(barcodeRow, rowParams)
+            if (scannedFormat == Barcode.FORMAT_QR_CODE && !hasNearbyText) {
+                val message = if (nearbyText == null) {
+                    "Could not read nearby text."
+                } else {
+                    "No nearby text with numbers found."
+                }
+                card.addView(label(message, 13f, Color.rgb(130, 144, 135)))
+            }
         } catch (_: Exception) {
             val error = label("This barcode format or data could not be recreated.", 15f, Color.rgb(145, 65, 54))
             card.addView(error)
@@ -626,6 +683,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         cameraProvider?.unbindAll()
+        textRecognizer?.close()
         cameraExecutor.shutdown()
         super.onDestroy()
     }

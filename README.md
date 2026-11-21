@@ -3,6 +3,7 @@
 ClearQR is a native Kotlin app that reads a code with the camera and redraws a crisp, scannable version on screen.
 
 - **Supported formats:** QR, EAN-8/13, UPC-A/E, Code 39/93/128, Codabar, ITF, Aztec, Data Matrix, and PDF417.
+- **Nearby numbers:** On-device text recognition finds nearby text containing numbers and displays that context alongside a recreated QR code.
 - **Recreation:** The decoded value is rendered in the detected barcode format where ZXing supports that format. The new code preserves the data, not the photographed code's exact appearance.
 - **Saved codes:** Choose a folder, name codes, browse saved entries, and reopen them as generated barcodes. Files contain the name, format, and decoded value—not an image—so they use little space. Scans are checked against the selected folder before saving.
 - **Privacy:** No photo is taken or uploaded. Saving is opt-in. Choose a device-only folder if you want the saved files kept out of cloud backups; ClearQR itself disables Android app backup.
