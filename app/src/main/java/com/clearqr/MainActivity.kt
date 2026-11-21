@@ -390,15 +390,27 @@ class MainActivity : ComponentActivity() {
         val tree = saveDirectory?.let { DocumentFile.fromTreeUri(this, it) }
             ?: return emptyList()
         if (!tree.canRead()) throw IllegalStateException("The selected folder is no longer accessible.")
-        return tree.listFiles().filter { it.isFile && it.name?.endsWith(".clearqr") == true }
-            .map { file ->
+        return tree.listFiles().filter {
+            it.isFile && (
+                it.name?.endsWith(".clearqr", ignoreCase = true) == true ||
+                    it.name?.endsWith(".json", ignoreCase = true) == true ||
+                    it.type == "application/json"
+                )
+        }.mapNotNull { file ->
                 val stream = contentResolver.openInputStream(file.uri)
                     ?: throw IllegalStateException("Could not read ${file.name}.")
-                stream.bufferedReader(Charsets.UTF_8).use {
-                    val json = org.json.JSONObject(it.readText())
-                    SavedCode(json.getString("name"), json.getString("value"), json.getInt("format"))
+                val json = stream.bufferedReader(Charsets.UTF_8).use { reader ->
+                    try {
+                        org.json.JSONObject(reader.readText())
+                    } catch (_: org.json.JSONException) {
+                        return@mapNotNull null
+                    }
                 }
-            }
+                val isClearQr = json.optInt("_clearqr") == 1 ||
+                    (json.has("name") && json.has("value") && json.has("format"))
+                if (!isClearQr) return@mapNotNull null
+                SavedCode(json.getString("name"), json.getString("value"), json.getInt("format"))
+        }
     }
 
     private fun saveCode(code: SavedCode) {
@@ -407,10 +419,10 @@ class MainActivity : ComponentActivity() {
         if (!tree.canWrite()) throw IllegalStateException("The selected folder is not writable.")
         if (findCode(code.value, code.format) != null) return
         val baseName = code.name.replace(Regex("[^A-Za-z0-9._ -]"), "_").trim().ifEmpty { "code" }
-        var fileName = "$baseName.clearqr"
+        var fileName = "$baseName.json"
         var suffix = 2
         while (tree.findFile(fileName) != null) {
-            fileName = "$baseName ($suffix).clearqr"
+            fileName = "$baseName ($suffix).json"
             suffix++
         }
         val file = tree.createFile("application/json", fileName)
@@ -418,6 +430,7 @@ class MainActivity : ComponentActivity() {
         try {
             contentResolver.openOutputStream(file.uri, "w")?.bufferedWriter(Charsets.UTF_8)?.use {
                 it.write(org.json.JSONObject()
+                    .put("_clearqr", 1)
                     .put("name", code.name)
                     .put("format", code.format)
                     .put("value", code.value)
