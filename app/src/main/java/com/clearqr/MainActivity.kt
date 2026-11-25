@@ -7,6 +7,8 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
@@ -142,7 +144,6 @@ class MainActivity : ComponentActivity() {
             setPadding(0, dp(15), 0, dp(15))
         }
         card.addView(hint, LinearLayout.LayoutParams(-1, -2))
-        addFooter(root)
         setContentView(root)
         startCamera()
     }
@@ -161,7 +162,6 @@ class MainActivity : ComponentActivity() {
         root.addView(button, LinearLayout.LayoutParams(-1, dp(54)).apply {
             topMargin = dp(30)
         })
-        addFooter(root)
         setContentView(root)
     }
 
@@ -325,7 +325,6 @@ class MainActivity : ComponentActivity() {
         card.addView(again, LinearLayout.LayoutParams(-1, dp(50)).apply {
             topMargin = dp(20)
         })
-        addFooter(root)
         setContentView(root)
     }
 
@@ -365,15 +364,42 @@ class MainActivity : ComponentActivity() {
             bottomMargin = dp(12)
         })
         val list = verticalLayout()
+        var codes = emptyList<SavedCode>()
         if (saveDirectory == null) {
             list.addView(label("Choose a folder to see and save your codes.", 15f, Color.rgb(114, 122, 115)))
         } else {
             try {
-                val codes = readSavedCodes()
+                codes = readSavedCodes()
                 if (codes.isEmpty()) {
                     list.addView(label("No saved codes yet.", 15f, Color.rgb(114, 122, 115)))
+                }
+            } catch (error: Exception) {
+                list.addView(label("Could not read the selected folder.", 15f, Color.rgb(145, 65, 54)))
+                showStorageError(error)
+            }
+        }
+        if (codes.isNotEmpty()) {
+            val search = EditText(this).apply {
+                hint = "Search saved codes"
+                textSize = 14f
+                singleLine = true
+                setPadding(dp(14), 0, dp(14), 0)
+                background = roundedBackground(Color.WHITE, 14f)
+            }
+            var ascending = true
+            lateinit var sortButton: Button
+            fun renderCodes() {
+                list.removeAllViews()
+                val matches = codes.filter {
+                    savedCodeMatchesQuery(it.name, it.value, search.text.toString())
+                }.sortedWith { first, second ->
+                    val comparison = compareSavedCodeNames(first.name, second.name)
+                    if (ascending) comparison else -comparison
+                }
+                if (matches.isEmpty()) {
+                    list.addView(label("No matching saved codes.", 15f, Color.rgb(114, 122, 115)))
                 } else {
-                    codes.sortedBy { it.name.lowercase() }.forEach { code ->
+                    matches.forEach { code ->
                         val item = actionButton("${code.name}\n${code.value.take(64)}") {
                             showResult(code.value, code.format, code.name)
                         }.apply {
@@ -385,14 +411,33 @@ class MainActivity : ComponentActivity() {
                         })
                     }
                 }
-            } catch (error: Exception) {
-                list.addView(label("Could not read the selected folder.", 15f, Color.rgb(145, 65, 54)))
-                showStorageError(error)
             }
+            sortButton = actionButton("Sort: A–Z") {
+                ascending = !ascending
+                sortButton.text = if (ascending) "Sort: A–Z" else "Sort: Z–A"
+                renderCodes()
+            }
+            val searchControls = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(search, LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                    rightMargin = dp(6)
+                })
+                addView(sortButton, LinearLayout.LayoutParams(-2, dp(46)).apply {
+                    leftMargin = dp(6)
+                })
+            }
+            root.addView(searchControls, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dp(8)
+            })
+            search.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = renderCodes()
+                override fun afterTextChanged(s: Editable?) = Unit
+            })
+            renderCodes()
         }
         val scroll = ScrollView(this).apply { addView(list) }
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(8) })
-        addFooter(root)
         setContentView(root)
     }
 
@@ -507,7 +552,6 @@ class MainActivity : ComponentActivity() {
         val root = createRoot()
         addHeader(root, "Camera unavailable.", "Close other camera apps and try again.")
         root.addView(actionButton("Try again") { showScanner() }, LinearLayout.LayoutParams(-1, dp(54)))
-        addFooter(root)
         setContentView(root)
     }
 
@@ -606,17 +650,6 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(8), dp(9), 0, 0)
         }
         root.addView(description)
-    }
-
-    private fun addFooter(root: LinearLayout) {
-        val footer = TextView(this).apply {
-            text = "✦   No scan photos are stored"
-            setTextColor(Color.rgb(137, 145, 137))
-            textSize = 11f
-            gravity = Gravity.CENTER
-            setPadding(0, dp(12), 0, dp(20))
-        }
-        root.addView(footer)
     }
 
     private fun addScanCorners(frame: FrameLayout) {
