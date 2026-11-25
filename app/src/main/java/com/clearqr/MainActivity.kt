@@ -1,17 +1,22 @@
 package com.clearqr
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
@@ -23,6 +28,7 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -37,6 +43,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
+private data class SavedCode(val name: String, val value: String, val format: Int)
+
 class MainActivity : ComponentActivity() {
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val captured = AtomicBoolean(false)
@@ -45,6 +53,34 @@ class MainActivity : ComponentActivity() {
     private var textRecognizer: TextRecognizer? = null
     private var previewView: PreviewView? = null
     private var scanFrame: FrameLayout? = null
+    private var saveDirectory: Uri? = null
+    private var pendingSave: Pair<String, Int>? = null
+
+    private val chooseDirectory =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri == null) {
+                pendingSave = null
+                return@registerForActivityResult
+            }
+            val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            try {
+                contentResolver.takePersistableUriPermission(uri, flags)
+                saveDirectory = uri
+                getPreferences(MODE_PRIVATE).edit().putString("save_directory", uri.toString()).apply()
+                pendingSave?.let { (value, format) ->
+                    pendingSave = null
+                    promptForName(value, format)
+                } ?: run {
+                    if (isSavedListVisible) showSavedCodes() else showScanner()
+                }
+            } catch (error: Exception) {
+                pendingSave = null
+                showStorageError(error)
+            }
+        }
+
+    private var isSavedListVisible = false
 
     private val requestCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) showScanner() else showPermissionMessage()
@@ -53,6 +89,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        saveDirectory = getPreferences(MODE_PRIVATE).getString("save_directory", null)?.let(Uri::parse)
         window.statusBarColor = Color.rgb(245, 244, 239)
         window.navigationBarColor = Color.rgb(245, 244, 239)
         window.decorView.systemUiVisibility =
@@ -67,9 +104,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showScanner() {
+        isSavedListVisible = false
         captured.set(false)
         val root = createRoot()
         addHeader(root, "Give it a\nclearer look.", "Read a QR code from anywhere and bring it back to life.")
+        addStorageControls(root)
 
         val card = verticalLayout().apply {
             background = roundedBackground(Color.WHITE, 26f)
@@ -169,42 +208,17 @@ class MainActivity : ComponentActivity() {
         scanner.process(input)
             .addOnSuccessListener { codes ->
                 val code = codes.firstOrNull { !it.rawValue.isNullOrEmpty() }
-                if (code == null) {
-                    finishFrame(proxy)
-                    return@addOnSuccessListener
-                }
-                val value = code.rawValue ?: run {
-                    finishFrame(proxy)
-                    return@addOnSuccessListener
-                }
-                if (code.format != Barcode.FORMAT_QR_CODE) {
-                    showCapturedResult(value, code.format, emptyList())
-                    finishFrame(proxy)
-                    return@addOnSuccessListener
-                }
-                val barcodeBounds = code.boundingBox
-                if (barcodeBounds == null) {
-                    showCapturedResult(value, code.format, null)
-                    finishFrame(proxy)
-                    return@addOnSuccessListener
-                }
-
-                recognizer.process(input)
-                    .addOnSuccessListener { recognizedText ->
-                        val bounds = barcodeBounds.toImageBounds()
-                        val lines = recognizedText.textBlocks.flatMap { block ->
-                            block.lines.mapNotNull { line ->
-                                line.boundingBox?.let {
-                                    RecognizedTextLine(line.text, it.toImageBounds())
-                                }
-                            }
-                        }
-                        showCapturedResult(value, code.format, NearbyNumberExtractor.findNearbyLines(bounds, lines))
+                    ?: return@addOnSuccessListener
+                val value = code.rawValue ?: return@addOnSuccessListener
+                if (captured.compareAndSet(false, true)) {
+                    try {
+                        val existing = findCode(value, code.format)
+                        showResult(value, code.format, existing?.name)
+                    } catch (error: Exception) {
+                        showStorageError(error)
+                        showResult(value, code.format)
                     }
-                    .addOnFailureListener {
-                        showCapturedResult(value, code.format, null)
-                    }
-                    .addOnCompleteListener { finishFrame(proxy) }
+                }
             }
             .addOnFailureListener { finishFrame(proxy) }
     }
@@ -223,10 +237,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun showResult(value: String, scannedFormat: Int, nearbyText: List<String>?) {
+    private fun showResult(value: String, scannedFormat: Int, existingName: String? = null) {
+        isSavedListVisible = false
         cameraProvider?.unbindAll()
         val root = createRoot()
-        addHeader(root, "Ready to scan.", "Scan it!.")
+        val subtitle = when {
+            existingName != null -> "Already saved as “$existingName”."
+            saveDirectory != null -> "This code is not saved yet. Give it a name to keep it."
+            else -> "This code is not saved yet. Choose a folder to keep it."
+        }
+        addHeader(root, if (existingName != null) "Already saved." else "Ready to scan.", subtitle)
         val card = verticalLayout().apply {
             background = roundedBackground(Color.WHITE, 26f)
             setPadding(dp(22), dp(22), dp(22), dp(22))
@@ -295,6 +315,10 @@ class MainActivity : ComponentActivity() {
             }
         card.addView(caption)
         card.addView(label(value, 13f, Color.rgb(55, 69, 61)))
+        if (existingName == null) {
+            card.addView(actionButton("Save code") { requestSave(value, scannedFormat) },
+                LinearLayout.LayoutParams(-1, dp(50)).apply { topMargin = dp(18) })
+        }
         val again = actionButton("Scan another") {
             showScanner()
         }
@@ -303,6 +327,180 @@ class MainActivity : ComponentActivity() {
         })
         addFooter(root)
         setContentView(root)
+    }
+
+    private fun addStorageControls(root: LinearLayout) {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(actionButton("Saved codes") { showSavedCodes() },
+            LinearLayout.LayoutParams(0, dp(46), 1f).apply { rightMargin = dp(6) })
+        row.addView(actionButton(if (saveDirectory == null) "Choose folder" else "Change folder") {
+            chooseDirectory.launch(saveDirectory)
+        }, LinearLayout.LayoutParams(0, dp(46), 1f).apply { leftMargin = dp(6) })
+        root.addView(row, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(14)
+            bottomMargin = dp(8)
+        })
+        val location = label(
+            if (saveDirectory == null) "Choose a device-only folder to keep saved codes out of cloud backups."
+            else "Saved codes go to your selected folder.",
+            12f,
+            Color.rgb(114, 122, 115)
+        )
+        root.addView(location)
+    }
+
+    private fun showSavedCodes() {
+        isSavedListVisible = true
+        cameraProvider?.unbindAll()
+        val root = createRoot()
+        addHeader(root, "Your saved\ncodes.", "Small text files, recreated as scannable codes when opened.")
+        val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        controls.addView(actionButton("Back to scanner") { showScanner() },
+            LinearLayout.LayoutParams(0, dp(46), 1f).apply { rightMargin = dp(6) })
+        controls.addView(actionButton(if (saveDirectory == null) "Choose folder" else "Change folder") {
+            chooseDirectory.launch(saveDirectory)
+        }, LinearLayout.LayoutParams(0, dp(46), 1f).apply { leftMargin = dp(6) })
+        root.addView(controls, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(14)
+            bottomMargin = dp(12)
+        })
+        val list = verticalLayout()
+        if (saveDirectory == null) {
+            list.addView(label("Choose a folder to see and save your codes.", 15f, Color.rgb(114, 122, 115)))
+        } else {
+            try {
+                val codes = readSavedCodes()
+                if (codes.isEmpty()) {
+                    list.addView(label("No saved codes yet.", 15f, Color.rgb(114, 122, 115)))
+                } else {
+                    codes.sortedBy { it.name.lowercase() }.forEach { code ->
+                        val item = actionButton("${code.name}\n${code.value.take(64)}") {
+                            showResult(code.value, code.format, code.name)
+                        }.apply {
+                            gravity = Gravity.CENTER_VERTICAL
+                            setPadding(dp(16), dp(10), dp(16), dp(10))
+                        }
+                        list.addView(item, LinearLayout.LayoutParams(-1, -2).apply {
+                            bottomMargin = dp(8)
+                        })
+                    }
+                }
+            } catch (error: Exception) {
+                list.addView(label("Could not read the selected folder.", 15f, Color.rgb(145, 65, 54)))
+                showStorageError(error)
+            }
+        }
+        val scroll = ScrollView(this).apply { addView(list) }
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(8) })
+        addFooter(root)
+        setContentView(root)
+    }
+
+    private fun requestSave(value: String, format: Int) {
+        pendingSave = value to format
+        if (saveDirectory == null) {
+            chooseDirectory.launch(null)
+        } else {
+            pendingSave = null
+            promptForName(value, format)
+        }
+    }
+
+    private fun promptForName(value: String, format: Int) {
+        val input = EditText(this).apply {
+            hint = "Name"
+            setSingleLine(true)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Name this code")
+            .setMessage("The code data will be saved as a small file in your selected folder.")
+            .setView(input)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save", null)
+            .create()
+            .also { dialog ->
+                dialog.setOnShowListener {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        val name = input.text.toString().trim()
+                        if (name.isEmpty()) {
+                            input.error = "Enter a name"
+                            return@setOnClickListener
+                        }
+                        try {
+                            saveCode(SavedCode(name, value, format))
+                            dialog.dismiss()
+                            showResult(value, format, name)
+                            Toast.makeText(this, "Code saved", Toast.LENGTH_SHORT).show()
+                        } catch (error: Exception) {
+                            showStorageError(error)
+                        }
+                    }
+                }
+                dialog.show()
+            }
+    }
+
+    private fun findCode(value: String, format: Int): SavedCode? =
+        readSavedCodes().firstOrNull { it.value == value && it.format == format }
+
+    private fun readSavedCodes(): List<SavedCode> {
+        val tree = saveDirectory?.let { DocumentFile.fromTreeUri(this, it) }
+            ?: return emptyList()
+        if (!tree.canRead()) throw IllegalStateException("The selected folder is no longer accessible.")
+        return tree.listFiles().filter {
+            it.isFile && (
+                it.name?.endsWith(".clearqr", ignoreCase = true) == true ||
+                    it.name?.endsWith(".json", ignoreCase = true) == true ||
+                    it.type == "application/json"
+                )
+        }.mapNotNull { file ->
+                val stream = contentResolver.openInputStream(file.uri)
+                    ?: throw IllegalStateException("Could not read ${file.name}.")
+                val json = stream.bufferedReader(Charsets.UTF_8).use { reader ->
+                    try {
+                        org.json.JSONObject(reader.readText())
+                    } catch (_: org.json.JSONException) {
+                        return@mapNotNull null
+                    }
+                }
+                val isClearQr = json.optInt("_clearqr") == 1 ||
+                    (json.has("name") && json.has("value") && json.has("format"))
+                if (!isClearQr) return@mapNotNull null
+                SavedCode(json.getString("name"), json.getString("value"), json.getInt("format"))
+        }
+    }
+
+    private fun saveCode(code: SavedCode) {
+        val tree = saveDirectory?.let { DocumentFile.fromTreeUri(this, it) }
+            ?: throw IllegalStateException("Choose a folder before saving.")
+        if (!tree.canWrite()) throw IllegalStateException("The selected folder is not writable.")
+        if (findCode(code.value, code.format) != null) return
+        val baseName = code.name.replace(Regex("[^A-Za-z0-9._ -]"), "_").trim().ifEmpty { "code" }
+        var fileName = "$baseName.json"
+        var suffix = 2
+        while (tree.findFile(fileName) != null) {
+            fileName = "$baseName ($suffix).json"
+            suffix++
+        }
+        val file = tree.createFile("application/json", fileName)
+            ?: throw IllegalStateException("Could not create a file in the selected folder.")
+        try {
+            contentResolver.openOutputStream(file.uri, "w")?.bufferedWriter(Charsets.UTF_8)?.use {
+                it.write(org.json.JSONObject()
+                    .put("_clearqr", 1)
+                    .put("name", code.name)
+                    .put("format", code.format)
+                    .put("value", code.value)
+                    .toString())
+            } ?: throw IllegalStateException("Could not write the saved code.")
+        } catch (error: Exception) {
+            file.delete()
+            throw error
+        }
+    }
+
+    private fun showStorageError(error: Exception) {
+        Toast.makeText(this, error.message ?: "Could not access the selected folder.", Toast.LENGTH_LONG).show()
     }
 
     private fun showCameraError() {
@@ -412,7 +610,7 @@ class MainActivity : ComponentActivity() {
 
     private fun addFooter(root: LinearLayout) {
         val footer = TextView(this).apply {
-            text = "✦   No saved photos here"
+            text = "✦   No scan photos are stored"
             setTextColor(Color.rgb(137, 145, 137))
             textSize = 11f
             gravity = Gravity.CENTER
